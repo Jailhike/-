@@ -126,6 +126,7 @@ async def gemini(cid: str, uid: int) -> str:
         "не используй чаще одного раза за несколько разговорных ходов. Не добавляй маркер, если "
         "пользователь не хочет фото. Обычный текст ответа должен оставаться естественным."
     )
+    body["systemInstruction"]["parts"][0]["text"] = sys_text
     gmsgs = [{"role": "system", "content": sys_text}] + [
         {"role": "user" if r == "user" else "assistant", "content": t} for r, t in rows]
     async with httpx.AsyncClient(timeout=40) as c:
@@ -451,9 +452,10 @@ async def chat(p: ChatIn, background_tasks: BackgroundTasks, x_init: str = Heade
     db.execute("INSERT INTO xp VALUES(?,?,1) ON CONFLICT(uid,cid) DO UPDATE SET xp=xp+1", (uid, p.cid))
     db.commit()
     photo_job_id = None
-    user_asked = any(word in p.text.lower() for word in (
+    lowered = p.text.lower()
+    user_asked = any(word in lowered for word in (
         "фото", "фотку", "фотограф", "снимок", "селфи", "picture", "photo", "selfie"
-    ))
+    )) and not any(neg in lowered for neg in ("не надо фото", "не присылай", "не отправляй", "без фото"))
     if initiative or user_asked:
         try:
             photo_job_id = create_photo_job(uid, p.cid, "")
