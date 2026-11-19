@@ -24,6 +24,7 @@ nav button{background:transparent;border:0;color:#8587a8;font:600 13px system-ui
 .bar{flex:1;min-width:36px;height:7px;background:#292b4b;border-radius:9px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--violet),var(--pink),var(--cyan));border-radius:9px;box-shadow:0 0 12px rgba(255,88,200,.6)}
 .msgs{display:flex;flex-direction:column;gap:9px;padding:4px 1px 14px}.m{max-width:84%;padding:11px 14px;border:1px solid rgba(159,143,255,.13);border-radius:17px 17px 17px 5px;background:linear-gradient(145deg,rgba(35,37,72,.95),rgba(23,25,51,.95));white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 5px 18px rgba(0,0,0,.12)}
 .m.user{align-self:flex-end;border-color:rgba(255,102,211,.26);border-radius:17px 17px 5px 17px;background:linear-gradient(120deg,#713f9f,#9a438d 58%,#684aa7);box-shadow:0 5px 22px rgba(185,72,190,.18)}
+.m.photo{max-width:90%;padding:7px}.generated-photo{display:block;width:100%;max-width:320px;border-radius:12px}.photo-status{font-size:12px;color:var(--mut);padding:3px 5px}
 #inp{display:flex;gap:9px;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:rgba(12,13,29,.94);border-top:1px solid var(--line);backdrop-filter:blur(20px)}
 #inp input{min-width:0;flex:1;padding:13px 16px;border-radius:18px;border:1px solid rgba(160,145,255,.2);outline:none;background:#171932;color:var(--text);font:inherit}#inp input:focus{border-color:var(--violet);box-shadow:0 0 0 3px rgba(154,107,255,.12)}
 #inp button{min-width:48px;background:linear-gradient(135deg,var(--violet),var(--pink));border:0;border-radius:16px;padding:0 16px;color:#fff;font-size:19px;box-shadow:0 5px 18px rgba(190,77,220,.25)}
@@ -59,15 +60,46 @@ function view(v){
 }
 function bubble(role,text){const d=document.createElement('div');d.className='m '+(role=='user'?'user':'');d.textContent=text;$('.msgs').appendChild(d);main.scrollTop=main.scrollHeight;return d}
 function hud(lv,pr,l){left=l;$('#lv').textContent='Ур. '+lv;$('#pr').style.width=(pr*100)+'%';$('#lim').textContent=l<0?'Сообщения без дневного лимита':(l>0?`Осталось сообщений: ${l}`:'Лимит на сегодня исчерпан, возвращайся завтра')}
+function showPhoto(jobId){
+  const wrap=document.createElement('div');wrap.className='m photo';
+  const status=document.createElement('div');status.className='photo-status';status.textContent='Создаю фотографию…';
+  wrap.appendChild(status);$('.msgs').appendChild(wrap);main.scrollTop=main.scrollHeight;
+  watchPhoto(jobId,wrap,status);
+}
+async function watchPhoto(jobId,wrap,status){
+  for(let i=0;i<45;i++){
+    try{
+      const result=await api('photos/'+encodeURIComponent(jobId));
+      if(result.status==='completed'){
+        const img=document.createElement('img');img.className='generated-photo';img.alt='Новое фото персонажа';
+        img.src='/api/photos/'+encodeURIComponent(jobId)+'/image?init_data='+encodeURIComponent(tg.initData);
+        status.remove();wrap.appendChild(img);main.scrollTop=main.scrollHeight;return;
+      }
+      if(result.status==='failed'){status.textContent='Не удалось создать фото. Попробуй ещё раз.';return}
+    }catch(e){status.textContent='Не удалось проверить состояние фотографии.';return}
+    await new Promise(resolve=>setTimeout(resolve,2000));
+  }
+  status.textContent='Генерация занимает больше времени. Проверь чат немного позже.';
+}
+async function requestPhoto(){
+  if(!cur)return;
+  const wrap=document.createElement('div');wrap.className='m photo';
+  const status=document.createElement('div');status.className='photo-status';status.textContent='Запрашиваю новую фотографию…';
+  wrap.appendChild(status);$('.msgs').appendChild(wrap);
+  try{const job=await api('photos',{method:'POST',body:JSON.stringify({cid:cur,prompt:''})});watchPhoto(job.job_id,wrap,status)}
+  catch(e){status.textContent=e.status===429?'Слишком много запросов. Попробуй позже.':'Генерация фотографий сейчас недоступна.'}
+}
 async function openChat(id){
   cur=id;const c=chars.find(x=>x.id==id);$('#nav').style.display='none';$('#inp').style.display='flex';
-  main.innerHTML=`<div class="top"><button onclick="view('home')" style="background:none;border:0;color:#fff;font-size:20px">‹</button>${avatarHTML(c)}<b>${esc(c.name)}</b>${c.custom?'<button onclick="del()" style="background:none;border:0;color:#9a92a8">🗑</button>':''}<span id="lv"></span><div class="bar"><i id="pr"></i></div></div><div class="msgs"></div><div class="lim" id="lim"></div>`;
+  main.innerHTML=`<div class="top"><button onclick="view('home')" style="background:none;border:0;color:#fff;font-size:20px">‹</button>${avatarHTML(c)}<b>${esc(c.name)}</b><button onclick="requestPhoto()" title="Создать фото" style="background:none;border:0;color:#fff;font-size:18px">📷</button>${c.custom?'<button onclick="del()" style="background:none;border:0;color:#9a92a8">🗑</button>':''}<span id="lv"></span><div class="bar"><i id="pr"></i></div></div><div class="msgs"></div><div class="lim" id="lim"></div>`;
   const h=await api('history/'+id);h.msgs.forEach(m=>bubble(m.role,m.text));hud(h.level,h.progress,h.left);
+  try{const saved=await api('photos?cid='+encodeURIComponent(id));saved.photos.filter(p=>p.status==='completed').reverse().forEach(p=>showPhoto(p.id));}catch(e){console.warn('photo history unavailable',e)}
 }
 async function send(){
   const t=$('#t').value.trim();if(!t||!cur)return;$('#t').value='';bubble('user',t);const w=bubble('model','…');
   try{const d=await api('chat',{method:'POST',body:JSON.stringify({cid:cur,text:t})});w.textContent=d.reply;hud(d.level,d.progress,d.left);
-    chars.find(x=>x.id==cur).last=d.reply;chars.find(x=>x.id==cur).ts=Date.now()}
+    chars.find(x=>x.id==cur).last=d.reply;chars.find(x=>x.id==cur).ts=Date.now();
+    if(d.photo_job_id)showPhoto(d.photo_job_id)}
   catch(e){w.textContent=e.status==429?'Лимит на сегодня исчерпан':'Ошибка, попробуй ещё раз'}
 }
 const PERS={sarc:'Дерзкая и саркастичная',soft:'Ласковая и заботливая',play:'Игривая, любит флирт',calm:'Спокойная и умная',fun:'Весёлая подруга'};
