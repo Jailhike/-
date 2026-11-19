@@ -50,7 +50,7 @@ PERS = {"sarc": "Дерзкая и саркастичная, любит подк
         "play": "Игривая, любит флирт и шутки", "calm": "Спокойная и умная, глубокие разговоры",
         "fun": "Весёлая подруга, мемы и болтовня"}
 
-db = sqlite3.connect("data.db", check_same_thread=False)
+db = sqlite3.connect(os.getenv("DB_PATH", "data.db"), check_same_thread=False)
 db.executescript("""
 CREATE TABLE IF NOT EXISTS msgs(uid INT, cid TEXT, role TEXT, text TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS usage(uid INT, day TEXT, n INT, PRIMARY KEY(uid, day));
@@ -121,7 +121,7 @@ async def gemini(cid: str, uid: int) -> str:
     body = {"systemInstruction": {"parts": [{"text": get_char(uid, cid)["prompt"] + tone(level(uid, cid)[0])}]},
             "contents": [{"role": "user" if r == "user" else "model", "parts": [{"text": t}]} for r, t in rows]}
     sys_text = body["systemInstruction"]["parts"][0]["text"] + (
-        "\\nЕсли в разговоре естественно уместно самой предложить новое безопасное фото, "
+        "\nЕсли в разговоре естественно уместно самой предложить новое безопасное фото, "
         "иногда добавь в самый конец ответа служебный маркер [[PHOTO_REQUEST]]; не объясняй его и "
         "не используй чаще одного раза за несколько разговорных ходов. Не добавляй маркер, если "
         "пользователь не хочет фото. Обычный текст ответа должен оставаться естественным."
@@ -383,7 +383,7 @@ def delete(cid: str, x_init: str = Header()):
         raise HTTPException(404)
     db.execute("DELETE FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid))
     db.execute("DELETE FROM avatars WHERE cid=? AND uid=?", (cid, uid))
-    for t in ("msgs", "xp"):
+    for t in ("msgs", "xp", "photo_jobs"):
         db.execute(f"DELETE FROM {t} WHERE uid=? AND cid=?", (uid, cid))
     db.commit()
     return {"ok": True}
