@@ -3,7 +3,7 @@ import os, json, hmac, hashlib, sqlite3, time, asyncio
 from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
@@ -222,8 +222,8 @@ async def create(p: CreateIn, x_init: str = Header()):
 
 
 @app.get("/api/avatar/{cid}")
-def avatar(cid: str, x_init: str = Header()):
-    uid = auth(x_init)
+def avatar(cid: str, x_init: str = Header(default=""), init_data: str = Query(default="")):
+    uid = auth(init_data or x_init)
     row = db.execute("SELECT mime,data FROM avatars WHERE cid=? AND (uid=? OR uid=0)",
                      (cid, uid)).fetchone()
     if not row:
