@@ -45,7 +45,7 @@ const $=s=>document.querySelector(s),main=$('#main');
 let chars=[],left=0,cur=null;
 const api=(p,o)=>fetch('/api/'+p,{headers:H,...o}).then(r=>{if(!r.ok)throw r;return r.json()});
 const esc=s=>String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const avatarHTML=c=>c.avatar?'<img class="portrait" alt="Портрет '+esc(c.name)+'" src="/api/avatar/'+encodeURIComponent(c.id)+'?init_data='+encodeURIComponent(tg.initData)+'">':'<div class="em">'+c.emoji+'</div>';
+const avatarHTML=c=>c.avatar?'<img class="portrait" loading="lazy" alt="Портрет '+esc(c.name)+'" src="/api/avatar/'+encodeURIComponent(c.id)+'?init_data='+encodeURIComponent(tg.initData)+'">':'<div class="em">'+c.emoji+'</div>';
 
 async function load(){const d=await api('chars');chars=d.chars;left=d.left}
 function view(v){
