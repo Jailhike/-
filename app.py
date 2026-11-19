@@ -1,20 +1,12 @@
-import base64
-import hashlib
-import hmac
-import json
-import os
-import sqlite3
-import time
-from contextlib import asynccontextmanager
+import os, json, hmac, hashlib, sqlite3, time, asyncio
 from urllib.parse import parse_qsl
-
+from contextlib import asynccontextmanager
 import httpx
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_KEY"]
@@ -23,7 +15,6 @@ GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versati
 APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",") if m.strip()]
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))
 XP_PER_LEVEL = 10
 
@@ -108,7 +99,6 @@ async def gemini(cid: str, uid: int) -> str:
     body = {"systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user" if role == "user" else "model", "parts": [{"text": text}]}
                          for role, text in rows]}
-
     async with httpx.AsyncClient(timeout=40) as client:
         if GROQ_KEY:
             groq_messages = [{"role": "system", "content": system}] + [
@@ -116,15 +106,14 @@ async def gemini(cid: str, uid: int) -> str:
                 for role, text in rows]
             for model in GROQ_MODELS:
                 try:
-                    response = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                        json={"model": model, "messages": groq_messages, "temperature": 1.0, "max_tokens": 300})
+                    response = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                                                 headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                                                 json={"model": model, "messages": groq_messages,
+                                                       "temperature": 1.0, "max_tokens": 300})
                     if response.status_code == 200:
                         return response.json()["choices"][0]["message"]["content"].strip()
                 except Exception as exc:
                     print("groq error:", model, repr(exc), flush=True)
-
         for model in MODELS:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
@@ -136,44 +125,11 @@ async def gemini(cid: str, uid: int) -> str:
     return "ой, что-то пошло не так, напиши ещё раз)"
 
 
-async def generate_photo(prompt: str) -> bytes:
-    safe_prompt = ("Create a safe-for-work portrait of one fictional adult woman who is visibly 21+ and fully "
-                   "clothed. Natural pose, tasteful realistic or anime style. No nudity or sexual content. "
-                   f"User request: {prompt}")
-    body = {"contents": [{"role": "user", "parts": [{"text": safe_prompt}]}],
-            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGE_MODEL}:generateContent?key={GEMINI_KEY}"
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(url, json=body)
-    if response.status_code != 200:
-        raise RuntimeError(response.text[:500])
-
-    for candidate in response.json().get("candidates", []):
-        for part in candidate.get("content", {}).get("parts", []):
-            inline = part.get("inlineData") or part.get("inline_data")
-            if inline and inline.get("data"):
-                return base64.b64decode(inline["data"])
-    raise RuntimeError("Image data was not returned")
-
-
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-
-@dp.message(Command("photo"))
-async def photo_command(message: types.Message):
-    prompt = message.text.partition(" ")[2].strip()
-    if not prompt:
-        await message.answer("Напишите описание: /photo девушка в летнем платье у моря")
-        return
-    await bot.send_chat_action(message.chat.id, "upload_photo")
-    try:
-        image = await generate_photo(prompt)
-        await message.answer_photo(BufferedInputFile(image, filename="portrait.png"), caption="Сгенерированный портрет")
-    except Exception as exc:
-        print("photo generation error:", repr(exc), flush=True)
-        await message.answer("Не удалось сгенерировать фото. Проверьте IMAGE_MODEL и GEMINI_KEY.")
+from photo_support import register_photo_handlers
+register_photo_handlers(bot, dp)
 
 
 @dp.message(CommandStart())
