@@ -7,8 +7,10 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 
 
-async def generate_photo(prompt: str) -> bytes:
-    api_key = os.environ["GEMINI_KEY"]
+async def generate_photo(prompt: str, api_key: str = None) -> bytes:
+    api_key = api_key or os.getenv("GEMINI_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_KEY is not configured")
     model = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 
