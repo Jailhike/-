@@ -1,5 +1,5 @@
 print("1: start", flush=True)
-import os, json, hmac, hashlib, sqlite3, time, asyncio, base64
+import os, json, hmac, hashlib, sqlite3, time, asyncio
 from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 import httpx
@@ -7,19 +7,18 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile
+from aiogram.filters import CommandStart
 
 print("2: imports ok", flush=True)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_KEY"]
-GROQ_KEY = os.getenv("GROQ_KEY")
+# Ключи вписаны прямо в файл: репозиторий на GitHub обязательно должен быть Private!
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "9291949369:AAHuyshxMysxE6p44JXwaxmeGnfwo6mNlpU"
+GEMINI_KEY = os.getenv("GEMINI_KEY") or "AQ.Ab8RN6Lf5iTgbdO5_V_mL_Y-FXk-uhz0XiSfzwrPeThFFKiSkA"
+GROQ_KEY = os.getenv("GROQ_KEY") or "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"
 GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile,openai/gpt-oss-120b").split(",") if m.strip()]
-APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]
+APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]  # https-адрес сервера (на Render подставляется сам)
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
-MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",") if m.strip()]
-IMAGE_MODELS = [m.strip() for m in os.getenv("IMAGE_MODELS", "gemini-2.5-flash-image").split(",") if m.strip()]
+MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",") if m.strip()]  # пробуются по очереди
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))
 XP_PER_LEVEL = 10
 
@@ -109,15 +108,14 @@ async def gemini(cid: str, uid: int) -> str:
     gmsgs = [{"role": "system", "content": sys_text}] + [
         {"role": "user" if r == "user" else "assistant", "content": t} for r, t in rows]
     async with httpx.AsyncClient(timeout=40) as c:
-        if GROQ_KEY:
+        if GROQ_KEY and "ВСТАВЬ" not in GROQ_KEY:
             for m in GROQ_MODELS:
                 r = None
                 try:
                     r = await c.post("https://api.groq.com/openai/v1/chat/completions",
                                      headers={"Authorization": f"Bearer {GROQ_KEY}"},
                                      json={"model": m, "messages": gmsgs, "temperature": 1.0, "max_tokens": 300})
-                    if r.status_code == 200:
-                        return r.json()["choices"][0]["message"]["content"].strip()
+                    return r.json()["choices"][0]["message"]["content"].strip()
                 except Exception as e:
                     print("groq error:", m, repr(e), getattr(r, "status_code", "?"), getattr(r, "text", "")[:300], flush=True)
         for m in MODELS:
@@ -125,33 +123,10 @@ async def gemini(cid: str, uid: int) -> str:
             r = None
             try:
                 r = await c.post(url, json=body)
-                if r.status_code == 200:
-                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
             except Exception as e:
                 print("gemini error:", m, repr(e), getattr(r, "status_code", "?"), getattr(r, "text", "")[:300], flush=True)
     return "ой, что-то пошло не так, напиши ещё раз)"
-
-
-async def generate_photo(prompt: str) -> bytes:
-    safe_prompt = ("Create a safe-for-work portrait of one fictional adult woman who is clearly 21+ and fully clothed. "
-                   "Natural pose, tasteful realistic or anime style. No nudity or sexual content. User request: " + prompt)
-    body = {"contents": [{"role": "user", "parts": [{"text": safe_prompt}]}],
-            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
-    async with httpx.AsyncClient(timeout=60) as c:
-        for model in IMAGE_MODELS:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-                r = await c.post(url, json=body)
-                if r.status_code != 200:
-                    continue
-                for candidate in r.json().get("candidates", []):
-                    for part in candidate.get("content", {}).get("parts", []):
-                        inline = part.get("inlineData") or part.get("inline_data")
-                        if inline and inline.get("data"):
-                            return base64.b64decode(inline["data"])
-            except Exception as e:
-                print("image error:", model, repr(e), flush=True)
-    raise RuntimeError("Image model did not return image data")
 
 
 bot = Bot(BOT_TOKEN)
@@ -163,27 +138,6 @@ async def start(m: types.Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[[
         types.InlineKeyboardButton(text="Запустить", web_app=types.WebAppInfo(url=APP_URL))]])
     await m.answer("Добро пожаловать! Выбери персонажа и начни общаться.", reply_markup=kb)
-
-
-@dp.message(Command("photo"))
-async def photo_command(m: types.Message):
-    prompt = m.text.partition(" ")[2].strip()
-    if not prompt:
-        await m.answer("Напишите описание: /photo девушка в летнем платье у моря")
-        return
-    await bot.send_chat_action(m.chat.id, "upload_photo")
-    try:
-        image = await generate_photo(prompt)
-        await m.answer_photo(BufferedInputFile(image, filename="portrait.png"), caption="Сгенерированный портрет")
-    except Exception as e:
-        print("photo generation error:", repr(e), flush=True)
-        await m.answer("Не удалось сгенерировать фото. Проверьте IMAGE_MODELS и GEMINI_KEY.")
-
-
-@dp.message()
-async def photo_as_ai_reply(m: types.Message):
-    if m.photo:
-        await m.answer("Фото получено. С помощью Gemini я могу описать или обработать его при настройке vision-модели.")
 
 
 async def setup_webhook():
