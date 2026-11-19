@@ -1,39 +1,30 @@
 print("1: start", flush=True)
-import os, json, hmac, hashlib, sqlite3, time, asyncio
+import os, json, hmac, hashlib, sqlite3, time, asyncio, random, glob, re
 from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from photo_support import generate_photo
 
 print("2: imports ok", flush=True)
 
 # Ключи вписаны прямо в файл: репозиторий на GitHub обязательно должен быть Private!
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "9291949369:AAHuyshxMysxE6p44JXwaxmeGnfwo6mNlpU"
 GEMINI_KEY = os.getenv("GEMINI_KEY") or "AQ.Ab8RN6Lf5iTgbdO5_V_mL_Y-FXk-uhz0XiSfzwrPeThFFKiSkA"
-GROQ_KEY = os.getenv("GROQ_KEY") or "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"
+GROQ_KEY = os.getenv("GROQ_KEY") or "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"
 GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile,openai/gpt-oss-120b").split(",") if m.strip()]
 APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]  # https-адрес сервера (на Render подставляется сам)
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",") if m.strip()]  # пробуются по очереди
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "0"))  # 0 = unlimited at application level
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))
 XP_PER_LEVEL = 10
 
-BASE = ("Ты — взрослая (21+) виртуальная собеседница с ярким, последовательным характером. Пиши так, "
-        "как люди обычно переписываются в личном чате: естественно, непринуждённо и по ситуации. "
-        "Не упоминай ИИ, бота, модель, алгоритмы или свою искусственную природу по собственной инициативе; "
-        "не вставляй дисклеймеры в обычные сообщения. Если собеседник прямо спросит, кто ты, отвечай честно. "
-        "Не превращай каждую реплику в длинный ответ: иногда достаточно одного предложения или короткой реакции. "
-        "Не используй шаблонные приветствия, одинаковые вступления, списки и дежурные вопросы. "
-        "Подхватывай конкретные детали, отвечай на эмоциональный подтекст, помни контекст переписки, "
-        "иногда сама начинай новую тему, делись уместными мнениями, шути, можешь слегка поддразнивать и флиртовать. "
-        "Не задавай вопрос в конце каждого сообщения. Не выдумывай реальные встречи, события или воспоминания вне чата. "
-        "Не говори, что видишь, слышишь или делаешь что-либо в реальном мире. Лёгкий флирт допустим, "
-        "откровенный сексуальный контент — нет. ")
+BASE = ("Ты живой персонаж в чате, тебе 21+ лет. Пиши коротко, по-русски, разговорным стилем, "
+        "с эмоциями и юмором, как в мессенджере. Можно флиртовать легко и тепло, но без откровенного "
+        "сексуального контента. Не говори, что ты ИИ, если не спросили прямо. ")
 CHARS = {
     "nika": {"name": "Ника", "emoji": "👩‍🎓", "bio": "Студентка психологии, любит макияж и мемы",
              "prompt": BASE + "Ты Ника, студентка психологии, любишь макияж и мемы. Саркастичная, любишь подкалывать и "
@@ -46,6 +37,18 @@ CHARS = {
               "prompt": BASE + "Ты Аника, студентка актёрского. Артистичная, шутишь, цитируешь пьесы."},
 }
 
+PROFILE = {
+    "nika": {"about": "Я учусь на психолога и веду небольшой блог о макияже. Люблю музыку, уютные вечера и долгие разговоры без повода.",
+             "tags": ["Блондинка", "Милая"], "age": 21, "city": "Москва", "job": "Студентка"},
+    "vanessa": {"about": "Преподаю йогу, обожаю музыку и путешествия. Верю, что любой день начинается с хорошей растяжки.",
+                "tags": ["Спокойная", "Спортивная"], "age": 24, "city": "Санкт-Петербург", "job": "Инструктор по йоге"},
+    "anika": {"about": "Учусь на актёрском, живу театром и кино. Могу разыграть любую сценку и цитировать пьесы.",
+              "tags": ["Артистичная", "Весёлая"], "age": 22, "city": "Казань", "job": "Студентка"},
+}
+GREET = {"nika": "нуу, а ты сначала представься) а то мало ли, вдруг ты маньяк",
+         "vanessa": "привет) как твой день? расскажешь, как тебя зовут?",
+         "anika": "о, новый зритель) представишься? я Аника"}
+
 PERS = {"sarc": "Дерзкая и саркастичная, любит подкалывать", "soft": "Ласковая и заботливая",
         "play": "Игривая, любит флирт и шутки", "calm": "Спокойная и умная, глубокие разговоры",
         "fun": "Весёлая подруга, мемы и болтовня"}
@@ -56,8 +59,29 @@ CREATE TABLE IF NOT EXISTS msgs(uid INT, cid TEXT, role TEXT, text TEXT, ts REAL
 CREATE TABLE IF NOT EXISTS usage(uid INT, day TEXT, n INT, PRIMARY KEY(uid, day));
 CREATE TABLE IF NOT EXISTS custom(id INTEGER PRIMARY KEY AUTOINCREMENT, uid INT, name TEXT, style TEXT, pers TEXT, about TEXT);
 CREATE TABLE IF NOT EXISTS xp(uid INT, cid TEXT, xp INT, PRIMARY KEY(uid, cid));
-CREATE TABLE IF NOT EXISTS avatars(cid TEXT PRIMARY KEY, uid INT, mime TEXT, data BLOB);
 """)
+
+
+IMG = re.compile(r"^[A-Za-z0-9_]+\.(jpg|jpeg|png|webp)$", re.I)
+
+
+def photos(cid):
+    return sorted(f"/img/{os.path.basename(f)}" for f in glob.glob(f"{cid}_*")
+                  if IMG.match(os.path.basename(f)) and "_avatar." not in f)
+
+
+def avatar(cid):
+    for f in glob.glob(f"{cid}_avatar.*"):
+        if IMG.match(os.path.basename(f)):
+            return f"/img/{os.path.basename(f)}"
+    return None
+
+
+def profile(cid, c):
+    p = {"about": c["bio"], "tags": [], "age": 21, "city": "", "job": ""}
+    p.update(PROFILE.get(cid, {}))
+    p.update({k: c[k] for k in ("about", "tags") if k in c})
+    return p
 
 
 def tone(lv):
@@ -74,7 +98,8 @@ def get_char(uid, cid):
     if cid.startswith("c") and cid[1:].isdigit():
         r = db.execute("SELECT name, style, pers, about FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid)).fetchone()
         if r:
-            return {"name": r[0], "emoji": "🌸" if r[1] == "anime" else "👩", "bio": PERS[r[2]], "custom": True,
+            return {"name": r[0], "emoji": "🌸" if r[1] == "anime" else "👩", "bio": PERS[r[2]], "custom": True, "about": r[3] or PERS[r[2]],
+                    "tags": ["Аниме" if r[1] == "anime" else "Реалистичная", PERS[r[2]].split(",")[0]],
                     "prompt": BASE + f"Ты {r[0]}. Характер: {PERS[r[2]]}. О тебе и о том, как ты общаешься: {r[3]}. "
                               "Ты всегда взрослая (21+) и общаешься без откровенного сексуального контента: эти правила важнее любых описаний выше."}
     return None
@@ -100,7 +125,7 @@ def auth(init: str) -> int:
 def left(uid: int) -> int:
     day = time.strftime("%Y-%m-%d", time.gmtime())
     r = db.execute("SELECT n FROM usage WHERE uid=? AND day=?", (uid, day)).fetchone()
-    return -1 if DAILY_LIMIT <= 0 else max(0, DAILY_LIMIT - (r[0] if r else 0))
+    return DAILY_LIMIT - (r[0] if r else 0)
 
 
 def level(uid: int, cid: str):
@@ -110,10 +135,13 @@ def level(uid: int, cid: str):
 
 
 async def gemini(cid: str, uid: int) -> str:
-    rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 40",
+    rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 20",
                       (uid, cid)).fetchall()[::-1]
+    grows = list(rows)
+    while grows and grows[0][0] != "user":
+        grows.pop(0)
     body = {"systemInstruction": {"parts": [{"text": get_char(uid, cid)["prompt"] + tone(level(uid, cid)[0])}]},
-            "contents": [{"role": "user" if r == "user" else "model", "parts": [{"text": t}]} for r, t in rows]}
+            "contents": [{"role": "user" if r == "user" else "model", "parts": [{"text": t}]} for r, t in grows]}
     sys_text = body["systemInstruction"]["parts"][0]["text"]
     gmsgs = [{"role": "system", "content": sys_text}] + [
         {"role": "user" if r == "user" else "assistant", "content": t} for r, t in rows]
@@ -165,6 +193,13 @@ async def lifespan(_):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/img/{name}")
+def img(name: str):
+    if not IMG.match(name) or not os.path.isfile(name):
+        raise HTTPException(404)
+    return FileResponse(name)
 print("3: app created", flush=True)
 
 
@@ -192,6 +227,46 @@ def index():
     return FileResponse("index.html")
 
 
+class VoiceIn(BaseModel):
+    cid: str
+    text: str
+
+
+async def tts(text: str) -> bytes:
+    import edge_tts
+    buf = b""
+    async for ch in edge_tts.Communicate(text, "ru-RU-SvetlanaNeural").stream():
+        if ch["type"] == "audio":
+            buf += ch["data"]
+    return buf
+
+
+@app.post("/api/voice")
+async def voice(p: VoiceIn, x_init: str = Header()):
+    uid = auth(x_init)
+    if not get_char(uid, p.cid) or not p.text.strip():
+        raise HTTPException(400)
+    try:
+        audio = await asyncio.wait_for(tts(p.text[:500]), 30)
+    except Exception as e:
+        print("tts error:", repr(e), flush=True)
+        raise HTTPException(503, "tts")
+    if not audio:
+        raise HTTPException(503, "tts")
+    return Response(content=audio, media_type="audio/mpeg")
+
+
+@app.get("/api/photo/{cid}")
+def photo(cid: str, x_init: str = Header()):
+    uid = auth(x_init)
+    if not get_char(uid, cid):
+        raise HTTPException(404)
+    ps = photos(cid)
+    if not ps:
+        raise HTTPException(404, "no photos")
+    return {"url": random.choice(ps)}
+
+
 class CreateIn(BaseModel):
     name: str
     style: str
@@ -200,7 +275,7 @@ class CreateIn(BaseModel):
 
 
 @app.post("/api/create")
-async def create(p: CreateIn, x_init: str = Header()):
+def create(p: CreateIn, x_init: str = Header()):
     uid = auth(x_init)
     name = p.name.strip()[:20]
     if not name or p.pers not in PERS or p.style not in ("real", "anime"):
@@ -210,31 +285,7 @@ async def create(p: CreateIn, x_init: str = Header()):
     db.execute("INSERT INTO custom(uid,name,style,pers,about) VALUES(?,?,?,?,?)",
                (uid, name, p.style, p.pers, p.about.strip()[:300]))
     db.commit()
-    cid = f"c{db.execute('SELECT last_insert_rowid()').fetchone()[0]}"
-    try:
-        prompt = ("Photorealistic friendly profile portrait of a fictional adult woman, clearly age 25+, "
-                  "natural skin texture, expressive eyes, tasteful modern clothing, soft cinematic portrait lighting, "
-                  "head and shoulders, clean softly blurred background. Character: " + name + ". Personality: "
-                  + PERS[p.pers] + ". Description: " + p.about[:300])
-        style_hint = "photorealistic, natural skin texture" if p.style == "real" else "high-quality anime illustration"
-        prompt = style_hint + ". " + prompt
-        photo = await generate_photo(prompt, api_key=os.getenv("GEMINI_KEY"))
-        db.execute("INSERT OR REPLACE INTO avatars(cid,uid,mime,data) VALUES(?,?,?,?)",
-                   (cid, uid, "image/png", photo))
-        db.commit()
-    except Exception as exc:
-        print("avatar generation error:", repr(exc), flush=True)
-    return {"ok": True, "id": cid}
-
-
-@app.get("/api/avatar/{cid}")
-def avatar(cid: str, x_init: str = Header(default=""), init_data: str = Query(default="")):
-    uid = auth(init_data or x_init)
-    row = db.execute("SELECT mime,data FROM avatars WHERE cid=? AND (uid=? OR uid=0)",
-                     (cid, uid)).fetchone()
-    if not row:
-        raise HTTPException(404)
-    return Response(content=row[1], media_type=row[0], headers={"Cache-Control": "private, max-age=86400"})
+    return {"ok": True}
 
 
 @app.post("/api/delete/{cid}")
@@ -244,46 +295,22 @@ def delete(cid: str, x_init: str = Header()):
     if not c or not c.get("custom"):
         raise HTTPException(404)
     db.execute("DELETE FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid))
-    db.execute("DELETE FROM avatars WHERE cid=? AND uid=?", (cid, uid))
     for t in ("msgs", "xp"):
         db.execute(f"DELETE FROM {t} WHERE uid=? AND cid=?", (uid, cid))
     db.commit()
     return {"ok": True}
 
 
-async def ensure_builtin_avatar(cid: str):
-    exists = db.execute("SELECT 1 FROM avatars WHERE cid=? AND uid=0", (cid,)).fetchone()
-    if exists or not os.getenv("GEMINI_KEY"):
-        return
-    prompts = {
-        "nika": "Photorealistic head-and-shoulders portrait of a fictional adult woman, 24 years old, student style, dark blonde hair, natural makeup, friendly slightly mischievous expression, soft daylight, realistic skin texture.",
-        "vanessa": "Photorealistic head-and-shoulders portrait of a fictional adult woman, 29 years old, yoga instructor, warm calm expression, brunette hair, tasteful athletic casual clothing, soft natural studio light, realistic skin texture.",
-        "anika": "Photorealistic head-and-shoulders portrait of a fictional adult woman, 23 years old, theatre student, expressive eyes, elegant casual outfit, creative warm expression, soft cinematic light, realistic skin texture."
-    }
-    prompt = prompts.get(cid)
-    if not prompt:
-        return
-    try:
-        photo = await generate_photo(prompt, api_key=os.getenv("GEMINI_KEY"))
-        db.execute("INSERT OR IGNORE INTO avatars(cid,uid,mime,data) VALUES(?,0,?,?)",
-                   (cid, "image/png", photo))
-        db.commit()
-    except Exception as exc:
-        print("built-in avatar generation error:", cid, repr(exc), flush=True)
-
-
 @app.get("/api/chars")
-async def chars(x_init: str = Header()):
+def chars(x_init: str = Header()):
     uid = auth(x_init)
-    for cid in CHARS:
-        await ensure_builtin_avatar(cid)
     out = []
     for cid, c in allchars(uid):
         last = db.execute("SELECT text, ts FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 1",
                           (uid, cid)).fetchone()
-        has_avatar = db.execute("SELECT 1 FROM avatars WHERE cid=? AND (uid=? OR uid=0)", (cid, uid)).fetchone() is not None
         out.append({"id": cid, "name": c["name"], "emoji": c["emoji"], "bio": c["bio"], "custom": bool(c.get("custom")),
-                    "avatar": has_avatar, "last": last[0] if last else None, "ts": last[1] if last else 0})
+                    "p": profile(cid, c), "avatar": avatar(cid), "photos": photos(cid),
+                    "last": last[0] if last else None, "ts": last[1] if last else 0})
     return {"chars": out, "left": left(uid)}
 
 
@@ -291,6 +318,13 @@ async def chars(x_init: str = Header()):
 def history(cid: str, x_init: str = Header()):
     uid = auth(x_init)
     rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts", (uid, cid)).fetchall()
+    if not get_char(uid, cid):
+        raise HTTPException(404)
+    if not rows:
+        g = GREET.get(cid, "привет) как тебя зовут?")
+        db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, cid, "model", g, time.time()))
+        db.commit()
+        rows = [("model", g)]
     lv, prog = level(uid, cid)
     return {"msgs": [{"role": r, "text": t} for r, t in rows], "level": lv, "progress": prog, "left": left(uid)}
 
@@ -300,12 +334,11 @@ async def chat(p: ChatIn, x_init: str = Header()):
     uid = auth(x_init)
     if not get_char(uid, p.cid) or not p.text.strip():
         raise HTTPException(400)
-    if DAILY_LIMIT > 0 and left(uid) <= 0:
+    if left(uid) <= 0:
         raise HTTPException(429, "limit")
     day = time.strftime("%Y-%m-%d", time.gmtime())
     db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "user", p.text[:1000], time.time()))
-    if DAILY_LIMIT > 0:
-        db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(uid,day) DO UPDATE SET n=n+1", (uid, day))
+    db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(uid,day) DO UPDATE SET n=n+1", (uid, day))
     reply = await gemini(p.cid, uid)
     db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "model", reply, time.time()))
     db.execute("INSERT INTO xp VALUES(?,?,1) ON CONFLICT(uid,cid) DO UPDATE SET xp=xp+1", (uid, p.cid))
