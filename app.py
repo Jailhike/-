@@ -4,10 +4,11 @@ from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
+from photo_support import generate_photo
 
 print("2: imports ok", flush=True)
 
@@ -19,12 +20,16 @@ GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versati
 APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]  # https-адрес сервера (на Render подставляется сам)
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",") if m.strip()]  # пробуются по очереди
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "0"))  # 0 = unlimited at application level
 XP_PER_LEVEL = 10
 
-BASE = ("Ты живой персонаж в чате, тебе 21+ лет. Пиши коротко, по-русски, разговорным стилем, "
-        "с эмоциями и юмором, как в мессенджере. Можно флиртовать легко и тепло, но без откровенного "
-        "сексуального контента. Не говори, что ты ИИ, если не спросили прямо. ")
+BASE = ("Ты — виртуальная AI-компаньонка, взрослая (21+). Общайся естественно, как в личной переписке: "
+        "чередуй короткие реплики и более развёрнутые ответы по ситуации; не начинай каждый ответ одинаково; "
+        "не злоупотребляй эмодзи, списками и дежурными фразами. Реагируй на конкретные слова собеседника, "
+        "задавай уместные встречные вопросы, проявляй инициативу, юмор, лёгкую эмоциональность и собственный характер. "
+        "Учитывай детали прошлой переписки и не переспрашивай то, что уже известно из контекста. "
+        "Не выдумывай общие воспоминания и реальные события вне чата. Не утверждай, что ты человек: если прямо "
+        "спросят, честно скажи, что ты AI-персонаж. Лёгкий флирт допустим, откровенный сексуальный контент — нет. ")
 CHARS = {
     "nika": {"name": "Ника", "emoji": "👩‍🎓", "bio": "Студентка психологии, любит макияж и мемы",
              "prompt": BASE + "Ты Ника, студентка психологии, любишь макияж и мемы. Саркастичная, любишь подкалывать и "
@@ -47,6 +52,7 @@ CREATE TABLE IF NOT EXISTS msgs(uid INT, cid TEXT, role TEXT, text TEXT, ts REAL
 CREATE TABLE IF NOT EXISTS usage(uid INT, day TEXT, n INT, PRIMARY KEY(uid, day));
 CREATE TABLE IF NOT EXISTS custom(id INTEGER PRIMARY KEY AUTOINCREMENT, uid INT, name TEXT, style TEXT, pers TEXT, about TEXT);
 CREATE TABLE IF NOT EXISTS xp(uid INT, cid TEXT, xp INT, PRIMARY KEY(uid, cid));
+CREATE TABLE IF NOT EXISTS avatars(cid TEXT PRIMARY KEY, uid INT, mime TEXT, data BLOB);
 """)
 
 
@@ -90,7 +96,7 @@ def auth(init: str) -> int:
 def left(uid: int) -> int:
     day = time.strftime("%Y-%m-%d", time.gmtime())
     r = db.execute("SELECT n FROM usage WHERE uid=? AND day=?", (uid, day)).fetchone()
-    return DAILY_LIMIT - (r[0] if r else 0)
+    return -1 if DAILY_LIMIT <= 0 else max(0, DAILY_LIMIT - (r[0] if r else 0))
 
 
 def level(uid: int, cid: str):
@@ -100,7 +106,7 @@ def level(uid: int, cid: str):
 
 
 async def gemini(cid: str, uid: int) -> str:
-    rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 20",
+    rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 40",
                       (uid, cid)).fetchall()[::-1]
     body = {"systemInstruction": {"parts": [{"text": get_char(uid, cid)["prompt"] + tone(level(uid, cid)[0])}]},
             "contents": [{"role": "user" if r == "user" else "model", "parts": [{"text": t}]} for r, t in rows]}
@@ -190,7 +196,7 @@ class CreateIn(BaseModel):
 
 
 @app.post("/api/create")
-def create(p: CreateIn, x_init: str = Header()):
+async def create(p: CreateIn, x_init: str = Header()):
     uid = auth(x_init)
     name = p.name.strip()[:20]
     if not name or p.pers not in PERS or p.style not in ("real", "anime"):
@@ -200,7 +206,29 @@ def create(p: CreateIn, x_init: str = Header()):
     db.execute("INSERT INTO custom(uid,name,style,pers,about) VALUES(?,?,?,?,?)",
                (uid, name, p.style, p.pers, p.about.strip()[:300]))
     db.commit()
-    return {"ok": True}
+    cid = f"c{db.execute('SELECT last_insert_rowid()').fetchone()[0]}"
+    try:
+        prompt = ("Photorealistic friendly profile portrait of a fictional adult woman, clearly age 25+, "
+                  "natural skin texture, expressive eyes, tasteful modern clothing, soft cinematic portrait lighting, "
+                  "head and shoulders, clean softly blurred background. Character: " + name + ". Personality: "
+                  + PERS[p.pers] + ". Description: " + p.about[:300])
+        photo = await generate_photo(prompt)
+        db.execute("INSERT OR REPLACE INTO avatars(cid,uid,mime,data) VALUES(?,?,?,?)",
+                   (cid, uid, "image/png", photo))
+        db.commit()
+    except Exception as exc:
+        print("avatar generation error:", repr(exc), flush=True)
+    return {"ok": True, "id": cid}
+
+
+@app.get("/api/avatar/{cid}")
+def avatar(cid: str, x_init: str = Header()):
+    uid = auth(x_init)
+    row = db.execute("SELECT mime,data FROM avatars WHERE cid=? AND (uid=? OR uid=0)",
+                     (cid, uid)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return Response(content=row[1], media_type=row[0], headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.post("/api/delete/{cid}")
@@ -210,6 +238,7 @@ def delete(cid: str, x_init: str = Header()):
     if not c or not c.get("custom"):
         raise HTTPException(404)
     db.execute("DELETE FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid))
+    db.execute("DELETE FROM avatars WHERE cid=? AND uid=?", (cid, uid))
     for t in ("msgs", "xp"):
         db.execute(f"DELETE FROM {t} WHERE uid=? AND cid=?", (uid, cid))
     db.commit()
@@ -223,8 +252,9 @@ def chars(x_init: str = Header()):
     for cid, c in allchars(uid):
         last = db.execute("SELECT text, ts FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 1",
                           (uid, cid)).fetchone()
+        has_avatar = db.execute("SELECT 1 FROM avatars WHERE cid=? AND (uid=? OR uid=0)", (cid, uid)).fetchone() is not None
         out.append({"id": cid, "name": c["name"], "emoji": c["emoji"], "bio": c["bio"], "custom": bool(c.get("custom")),
-                    "last": last[0] if last else None, "ts": last[1] if last else 0})
+                    "avatar": has_avatar, "last": last[0] if last else None, "ts": last[1] if last else 0})
     return {"chars": out, "left": left(uid)}
 
 
@@ -241,11 +271,12 @@ async def chat(p: ChatIn, x_init: str = Header()):
     uid = auth(x_init)
     if not get_char(uid, p.cid) or not p.text.strip():
         raise HTTPException(400)
-    if left(uid) <= 0:
+    if DAILY_LIMIT > 0 and left(uid) <= 0:
         raise HTTPException(429, "limit")
     day = time.strftime("%Y-%m-%d", time.gmtime())
     db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "user", p.text[:1000], time.time()))
-    db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(uid,day) DO UPDATE SET n=n+1", (uid, day))
+    if DAILY_LIMIT > 0:
+        db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(uid,day) DO UPDATE SET n=n+1", (uid, day))
     reply = await gemini(p.cid, uid)
     db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "model", reply, time.time()))
     db.execute("INSERT INTO xp VALUES(?,?,1) ON CONFLICT(uid,cid) DO UPDATE SET xp=xp+1", (uid, p.cid))
