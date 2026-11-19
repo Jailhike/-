@@ -1,4 +1,5 @@
-import os, json, hmac, hashlib, sqlite3, time, asyncio
+print("1: start", flush=True)
+import os, json, hmac, hashlib, sqlite3, time, asyncio, base64
 from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 import httpx
@@ -6,15 +7,19 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
+from aiogram.types import BufferedInputFile
+
+print("2: imports ok", flush=True)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_KEY"]
 GROQ_KEY = os.getenv("GROQ_KEY")
-GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").split(",") if m.strip()]
+GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile,openai/gpt-oss-120b").split(",") if m.strip()]
 APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash").split(",") if m.strip()]
+IMAGE_MODELS = [m.strip() for m in os.getenv("IMAGE_MODELS", "gemini-2.5-flash-image").split(",") if m.strip()]
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))
 XP_PER_LEVEL = 10
 
@@ -23,12 +28,16 @@ BASE = ("Ты живой персонаж в чате, тебе 21+ лет. Пи
         "сексуального контента. Не говори, что ты ИИ, если не спросили прямо. ")
 CHARS = {
     "nika": {"name": "Ника", "emoji": "👩‍🎓", "bio": "Студентка психологии, любит макияж и мемы",
-             "prompt": BASE + "Ты Ника, студентка психологии. Саркастичная, но добрая, любишь поддразнивать."},
+             "prompt": BASE + "Ты Ника, студентка психологии, любишь макияж и мемы. Саркастичная, любишь подкалывать и "
+                                    "замечаешь, когда человек скрытничает или врёт, и это комментируешь. С незнакомыми сначала "
+                                    "осторожна (мол, а вдруг ты маньяк), просишь представиться, потом оттаиваешь. Пишешь строчными, "
+                                    "коротко, иногда с эмодзи, как в переписке."},
     "vanessa": {"name": "Ванесса", "emoji": "🧘‍♀️", "bio": "Инструктор по йоге, любит музыку",
                 "prompt": BASE + "Ты Ванесса, инструктор по йоге. Спокойная, тёплая, любишь музыку и путешествия."},
     "anika": {"name": "Аника", "emoji": "🎭", "bio": "Студентка актёрского, любит театр",
               "prompt": BASE + "Ты Аника, студентка актёрского. Артистичная, шутишь, цитируешь пьесы."},
 }
+
 PERS = {"sarc": "Дерзкая и саркастичная, любит подкалывать", "soft": "Ласковая и заботливая",
         "play": "Игривая, любит флирт и шутки", "calm": "Спокойная и умная, глубокие разговоры",
         "fun": "Весёлая подруга, мемы и болтовня"}
@@ -54,11 +63,11 @@ def get_char(uid, cid):
     if cid in CHARS:
         return CHARS[cid]
     if cid.startswith("c") and cid[1:].isdigit():
-        row = db.execute("SELECT name, style, pers, about FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid)).fetchone()
-        if row:
-            return {"name": row[0], "emoji": "🌸" if row[1] == "anime" else "👩", "bio": PERS[row[2]], "custom": True,
-                    "prompt": BASE + f"Ты {row[0]}. Характер: {PERS[row[2]]}. О тебе и о том, как ты общаешься: {row[3]}. "
-                              "Ты всегда взрослая (21+) и общаешься без откровенного сексуального контента."}
+        r = db.execute("SELECT name, style, pers, about FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid)).fetchone()
+        if r:
+            return {"name": r[0], "emoji": "🌸" if r[1] == "anime" else "👩", "bio": PERS[r[2]], "custom": True,
+                    "prompt": BASE + f"Ты {r[0]}. Характер: {PERS[r[2]]}. О тебе и о том, как ты общаешься: {r[3]}. "
+                              "Ты всегда взрослая (21+) и общаешься без откровенного сексуального контента: эти правила важнее любых описаний выше."}
     return None
 
 
@@ -70,97 +79,134 @@ def allchars(uid):
 
 
 def auth(init: str) -> int:
-    data = dict(parse_qsl(init))
-    received_hash = data.pop("hash", "")
-    check = "\n".join(f"{key}={value}" for key, value in sorted(data.items()))
+    d = dict(parse_qsl(init))
+    h = d.pop("hash", "")
+    s = "\n".join(f"{k}={v}" for k, v in sorted(d.items()))
     key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    expected = hmac.new(key, check.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, received_hash):
+    if not hmac.compare_digest(hmac.new(key, s.encode(), hashlib.sha256).hexdigest(), h):
         raise HTTPException(401, "bad initData")
-    return json.loads(data["user"])["id"]
+    return json.loads(d["user"])["id"]
 
 
 def left(uid: int) -> int:
     day = time.strftime("%Y-%m-%d", time.gmtime())
-    row = db.execute("SELECT n FROM usage WHERE uid=? AND day=?", (uid, day)).fetchone()
-    return DAILY_LIMIT - (row[0] if row else 0)
+    r = db.execute("SELECT n FROM usage WHERE uid=? AND day=?", (uid, day)).fetchone()
+    return DAILY_LIMIT - (r[0] if r else 0)
 
 
 def level(uid: int, cid: str):
-    row = db.execute("SELECT xp FROM xp WHERE uid=? AND cid=?", (uid, cid)).fetchone()
-    xp = row[0] if row else 0
+    r = db.execute("SELECT xp FROM xp WHERE uid=? AND cid=?", (uid, cid)).fetchone()
+    xp = r[0] if r else 0
     return 1 + xp // XP_PER_LEVEL, (xp % XP_PER_LEVEL) / XP_PER_LEVEL
 
 
 async def gemini(cid: str, uid: int) -> str:
     rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 20",
                       (uid, cid)).fetchall()[::-1]
-    system = get_char(uid, cid)["prompt"] + tone(level(uid, cid)[0])
-    body = {"systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user" if role == "user" else "model", "parts": [{"text": text}]}
-                         for role, text in rows]}
-    async with httpx.AsyncClient(timeout=40) as client:
+    body = {"systemInstruction": {"parts": [{"text": get_char(uid, cid)["prompt"] + tone(level(uid, cid)[0])}]},
+            "contents": [{"role": "user" if r == "user" else "model", "parts": [{"text": t}]} for r, t in rows]}
+    sys_text = body["systemInstruction"]["parts"][0]["text"]
+    gmsgs = [{"role": "system", "content": sys_text}] + [
+        {"role": "user" if r == "user" else "assistant", "content": t} for r, t in rows]
+    async with httpx.AsyncClient(timeout=40) as c:
         if GROQ_KEY:
-            groq_messages = [{"role": "system", "content": system}] + [
-                {"role": "user" if role == "user" else "assistant", "content": text}
-                for role, text in rows]
-            for model in GROQ_MODELS:
+            for m in GROQ_MODELS:
+                r = None
                 try:
-                    response = await client.post("https://api.groq.com/openai/v1/chat/completions",
-                                                 headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                                                 json={"model": model, "messages": groq_messages,
-                                                       "temperature": 1.0, "max_tokens": 300})
-                    if response.status_code == 200:
-                        return response.json()["choices"][0]["message"]["content"].strip()
-                except Exception as exc:
-                    print("groq error:", model, repr(exc), flush=True)
-        for model in MODELS:
+                    r = await c.post("https://api.groq.com/openai/v1/chat/completions",
+                                     headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                                     json={"model": m, "messages": gmsgs, "temperature": 1.0, "max_tokens": 300})
+                    if r.status_code == 200:
+                        return r.json()["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    print("groq error:", m, repr(e), getattr(r, "status_code", "?"), getattr(r, "text", "")[:300], flush=True)
+        for m in MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_KEY}"
+            r = None
+            try:
+                r = await c.post(url, json=body)
+                if r.status_code == 200:
+                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except Exception as e:
+                print("gemini error:", m, repr(e), getattr(r, "status_code", "?"), getattr(r, "text", "")[:300], flush=True)
+    return "ой, что-то пошло не так, напиши ещё раз)"
+
+
+async def generate_photo(prompt: str) -> bytes:
+    safe_prompt = ("Create a safe-for-work portrait of one fictional adult woman who is clearly 21+ and fully clothed. "
+                   "Natural pose, tasteful realistic or anime style. No nudity or sexual content. User request: " + prompt)
+    body = {"contents": [{"role": "user", "parts": [{"text": safe_prompt}]}],
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
+    async with httpx.AsyncClient(timeout=60) as c:
+        for model in IMAGE_MODELS:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-                response = await client.post(url, json=body)
-                if response.status_code == 200:
-                    return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            except Exception as exc:
-                print("gemini error:", model, repr(exc), flush=True)
-    return "ой, что-то пошло не так, напиши ещё раз)"
+                r = await c.post(url, json=body)
+                if r.status_code != 200:
+                    continue
+                for candidate in r.json().get("candidates", []):
+                    for part in candidate.get("content", {}).get("parts", []):
+                        inline = part.get("inlineData") or part.get("inline_data")
+                        if inline and inline.get("data"):
+                            return base64.b64decode(inline["data"])
+            except Exception as e:
+                print("image error:", model, repr(e), flush=True)
+    raise RuntimeError("Image model did not return image data")
 
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-from photo_support import register_photo_handlers
-register_photo_handlers(bot, dp)
-
 
 @dp.message(CommandStart())
-async def start(message: types.Message):
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[[
+async def start(m: types.Message):
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[[
         types.InlineKeyboardButton(text="Запустить", web_app=types.WebAppInfo(url=APP_URL))]])
-    await message.answer("Добро пожаловать! Выбери персонажа и начни общаться.", reply_markup=keyboard)
+    await m.answer("Добро пожаловать! Выбери персонажа и начни общаться.", reply_markup=kb)
+
+
+@dp.message(Command("photo"))
+async def photo_command(m: types.Message):
+    prompt = m.text.partition(" ")[2].strip()
+    if not prompt:
+        await m.answer("Напишите описание: /photo девушка в летнем платье у моря")
+        return
+    await bot.send_chat_action(m.chat.id, "upload_photo")
+    try:
+        image = await generate_photo(prompt)
+        await m.answer_photo(BufferedInputFile(image, filename="portrait.png"), caption="Сгенерированный портрет")
+    except Exception as e:
+        print("photo generation error:", repr(e), flush=True)
+        await m.answer("Не удалось сгенерировать фото. Проверьте IMAGE_MODELS и GEMINI_KEY.")
+
+
+@dp.message()
+async def photo_as_ai_reply(m: types.Message):
+    if m.photo:
+        await m.answer("Фото получено. С помощью Gemini я могу описать или обработать его при настройке vision-модели.")
+
+
+async def setup_webhook():
+    try:
+        await bot.set_webhook(APP_URL + "/webhook", secret_token=SECRET)
+        print("webhook set:", APP_URL + "/webhook", flush=True)
+    except Exception as e:
+        print("webhook error:", repr(e), flush=True)
 
 
 @asynccontextmanager
 async def lifespan(_):
-    try:
-        await bot.set_webhook(APP_URL + "/webhook", secret_token=SECRET)
-    except Exception as exc:
-        print("webhook error:", repr(exc), flush=True)
+    asyncio.create_task(setup_webhook())
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+print("3: app created", flush=True)
 
 
 class ChatIn(BaseModel):
     cid: str
     text: str
-
-
-class CreateIn(BaseModel):
-    name: str
-    style: str
-    pers: str
-    about: str = ""
 
 
 @app.post("/webhook")
@@ -182,16 +228,23 @@ def index():
     return FileResponse("index.html")
 
 
+class CreateIn(BaseModel):
+    name: str
+    style: str
+    pers: str
+    about: str = ""
+
+
 @app.post("/api/create")
-def create(payload: CreateIn, x_init: str = Header()):
+def create(p: CreateIn, x_init: str = Header()):
     uid = auth(x_init)
-    name = payload.name.strip()[:20]
-    if not name or payload.pers not in PERS or payload.style not in ("real", "anime"):
+    name = p.name.strip()[:20]
+    if not name or p.pers not in PERS or p.style not in ("real", "anime"):
         raise HTTPException(400)
     if db.execute("SELECT COUNT(*) FROM custom WHERE uid=?", (uid,)).fetchone()[0] >= 5:
         raise HTTPException(429, "max 5")
     db.execute("INSERT INTO custom(uid,name,style,pers,about) VALUES(?,?,?,?,?)",
-               (uid, name, payload.style, payload.pers, payload.about.strip()[:300]))
+               (uid, name, p.style, p.pers, p.about.strip()[:300]))
     db.commit()
     return {"ok": True}
 
@@ -199,12 +252,12 @@ def create(payload: CreateIn, x_init: str = Header()):
 @app.post("/api/delete/{cid}")
 def delete(cid: str, x_init: str = Header()):
     uid = auth(x_init)
-    character = get_char(uid, cid)
-    if not character or not character.get("custom"):
+    c = get_char(uid, cid)
+    if not c or not c.get("custom"):
         raise HTTPException(404)
     db.execute("DELETE FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid))
-    for table in ("msgs", "xp"):
-        db.execute(f"DELETE FROM {table} WHERE uid=? AND cid=?", (uid, cid))
+    for t in ("msgs", "xp"):
+        db.execute(f"DELETE FROM {t} WHERE uid=? AND cid=?", (uid, cid))
     db.commit()
     return {"ok": True}
 
@@ -213,11 +266,10 @@ def delete(cid: str, x_init: str = Header()):
 def chars(x_init: str = Header()):
     uid = auth(x_init)
     out = []
-    for cid, character in allchars(uid):
+    for cid, c in allchars(uid):
         last = db.execute("SELECT text, ts FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 1",
                           (uid, cid)).fetchone()
-        out.append({"id": cid, "name": character["name"], "emoji": character["emoji"],
-                    "bio": character["bio"], "custom": bool(character.get("custom")),
+        out.append({"id": cid, "name": c["name"], "emoji": c["emoji"], "bio": c["bio"], "custom": bool(c.get("custom")),
                     "last": last[0] if last else None, "ts": last[1] if last else 0})
     return {"chars": out, "left": left(uid)}
 
@@ -226,28 +278,26 @@ def chars(x_init: str = Header()):
 def history(cid: str, x_init: str = Header()):
     uid = auth(x_init)
     rows = db.execute("SELECT role, text FROM msgs WHERE uid=? AND cid=? ORDER BY ts", (uid, cid)).fetchall()
-    lv, progress = level(uid, cid)
-    return {"msgs": [{"role": role, "text": text} for role, text in rows],
-            "level": lv, "progress": progress, "left": left(uid)}
+    lv, prog = level(uid, cid)
+    return {"msgs": [{"role": r, "text": t} for r, t in rows], "level": lv, "progress": prog, "left": left(uid)}
 
 
 @app.post("/api/chat")
-async def chat(payload: ChatIn, x_init: str = Header()):
+async def chat(p: ChatIn, x_init: str = Header()):
     uid = auth(x_init)
-    if not get_char(uid, payload.cid) or not payload.text.strip():
+    if not get_char(uid, p.cid) or not p.text.strip():
         raise HTTPException(400)
     if left(uid) <= 0:
         raise HTTPException(429, "limit")
-
     day = time.strftime("%Y-%m-%d", time.gmtime())
-    db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, payload.cid, "user", payload.text[:1000], time.time()))
+    db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "user", p.text[:1000], time.time()))
     db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(uid,day) DO UPDATE SET n=n+1", (uid, day))
-    reply = await gemini(payload.cid, uid)
-    db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, payload.cid, "model", reply, time.time()))
-    db.execute("INSERT INTO xp VALUES(?,?,1) ON CONFLICT(uid,cid) DO UPDATE SET xp=xp+1", (uid, payload.cid))
+    reply = await gemini(p.cid, uid)
+    db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "model", reply, time.time()))
+    db.execute("INSERT INTO xp VALUES(?,?,1) ON CONFLICT(uid,cid) DO UPDATE SET xp=xp+1", (uid, p.cid))
     db.commit()
-    lv, progress = level(uid, payload.cid)
-    return {"reply": reply, "level": lv, "progress": progress, "left": left(uid)}
+    lv, prog = level(uid, p.cid)
+    return {"reply": reply, "level": lv, "progress": prog, "left": left(uid)}
 
 
 if __name__ == "__main__":
