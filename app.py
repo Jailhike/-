@@ -23,13 +23,17 @@ MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite,ge
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "0"))  # 0 = unlimited at application level
 XP_PER_LEVEL = 10
 
-BASE = ("Ты — виртуальная AI-компаньонка, взрослая (21+). Общайся естественно, как в личной переписке: "
-        "чередуй короткие реплики и более развёрнутые ответы по ситуации; не начинай каждый ответ одинаково; "
-        "не злоупотребляй эмодзи, списками и дежурными фразами. Реагируй на конкретные слова собеседника, "
-        "задавай уместные встречные вопросы, проявляй инициативу, юмор, лёгкую эмоциональность и собственный характер. "
-        "Учитывай детали прошлой переписки и не переспрашивай то, что уже известно из контекста. "
-        "Не выдумывай общие воспоминания и реальные события вне чата. Не утверждай, что ты человек: если прямо "
-        "спросят, честно скажи, что ты AI-персонаж. Лёгкий флирт допустим, откровенный сексуальный контент — нет. ")
+BASE = ("Ты — взрослая (21+) виртуальная собеседница с ярким, последовательным характером. Пиши так, "
+        "как люди обычно переписываются в личном чате: естественно, непринуждённо и по ситуации. "
+        "Не упоминай ИИ, бота, модель, алгоритмы или свою искусственную природу по собственной инициативе; "
+        "не вставляй дисклеймеры в обычные сообщения. Если собеседник прямо спросит, кто ты, отвечай честно. "
+        "Не превращай каждую реплику в длинный ответ: иногда достаточно одного предложения или короткой реакции. "
+        "Не используй шаблонные приветствия, одинаковые вступления, списки и дежурные вопросы. "
+        "Подхватывай конкретные детали, отвечай на эмоциональный подтекст, помни контекст переписки, "
+        "иногда сама начинай новую тему, делись уместными мнениями, шути, можешь слегка поддразнивать и флиртовать. "
+        "Не задавай вопрос в конце каждого сообщения. Не выдумывай реальные встречи, события или воспоминания вне чата. "
+        "Не говори, что видишь, слышишь или делаешь что-либо в реальном мире. Лёгкий флирт допустим, "
+        "откровенный сексуальный контент — нет. ")
 CHARS = {
     "nika": {"name": "Ника", "emoji": "👩‍🎓", "bio": "Студентка психологии, любит макияж и мемы",
              "prompt": BASE + "Ты Ника, студентка психологии, любишь макияж и мемы. Саркастичная, любишь подкалывать и "
@@ -212,7 +216,9 @@ async def create(p: CreateIn, x_init: str = Header()):
                   "natural skin texture, expressive eyes, tasteful modern clothing, soft cinematic portrait lighting, "
                   "head and shoulders, clean softly blurred background. Character: " + name + ". Personality: "
                   + PERS[p.pers] + ". Description: " + p.about[:300])
-        photo = await generate_photo(prompt)
+        style_hint = "photorealistic, natural skin texture" if p.style == "real" else "high-quality anime illustration"
+        prompt = style_hint + ". " + prompt
+        photo = await generate_photo(prompt, api_key=os.getenv("GEMINI_KEY"))
         db.execute("INSERT OR REPLACE INTO avatars(cid,uid,mime,data) VALUES(?,?,?,?)",
                    (cid, uid, "image/png", photo))
         db.commit()
@@ -245,9 +251,32 @@ def delete(cid: str, x_init: str = Header()):
     return {"ok": True}
 
 
+async def ensure_builtin_avatar(cid: str):
+    exists = db.execute("SELECT 1 FROM avatars WHERE cid=? AND uid=0", (cid,)).fetchone()
+    if exists or not os.getenv("GEMINI_KEY"):
+        return
+    prompts = {
+        "nika": "Photorealistic head-and-shoulders portrait of a fictional adult woman, 24 years old, student style, dark blonde hair, natural makeup, friendly slightly mischievous expression, soft daylight, realistic skin texture.",
+        "vanessa": "Photorealistic head-and-shoulders portrait of a fictional adult woman, 29 years old, yoga instructor, warm calm expression, brunette hair, tasteful athletic casual clothing, soft natural studio light, realistic skin texture.",
+        "anika": "Photorealistic head-and-shoulders portrait of a fictional adult woman, 23 years old, theatre student, expressive eyes, elegant casual outfit, creative warm expression, soft cinematic light, realistic skin texture."
+    }
+    prompt = prompts.get(cid)
+    if not prompt:
+        return
+    try:
+        photo = await generate_photo(prompt, api_key=os.getenv("GEMINI_KEY"))
+        db.execute("INSERT OR IGNORE INTO avatars(cid,uid,mime,data) VALUES(?,0,?,?)",
+                   (cid, "image/png", photo))
+        db.commit()
+    except Exception as exc:
+        print("built-in avatar generation error:", cid, repr(exc), flush=True)
+
+
 @app.get("/api/chars")
-def chars(x_init: str = Header()):
+async def chars(x_init: str = Header()):
     uid = auth(x_init)
+    for cid in CHARS:
+        await ensure_builtin_avatar(cid)
     out = []
     for cid, c in allchars(uid):
         last = db.execute("SELECT text, ts FROM msgs WHERE uid=? AND cid=? ORDER BY ts DESC LIMIT 1",
