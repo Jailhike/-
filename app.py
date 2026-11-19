@@ -3,7 +3,7 @@ import os, json, hmac, hashlib, sqlite3, time, asyncio
 from urllib.parse import parse_qsl
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi import FastAPI, Header, HTTPException, Request, Query, BackgroundTasks
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
@@ -12,10 +12,10 @@ from photo_support import generate_photo
 
 print("2: imports ok", flush=True)
 
-# Ключи вписаны прямо в файл: репозиторий на GitHub обязательно должен быть Private!
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "9291949369:AAHuyshxMysxE6p44JXwaxmeGnfwo6mNlpU"
-GEMINI_KEY = os.getenv("GEMINI_KEY") or "AQ.Ab8RN6Lf5iTgbdO5_V_mL_Y-FXk-uhz0XiSfzwrPeThFFKiSkA"
-GROQ_KEY = os.getenv("GROQ_KEY") or "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"
+# All credentials must be configured as Render environment variables.
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GEMINI_KEY = os.getenv("GEMINI_KEY", "")
+GROQ_KEY = os.getenv("GROQ_KEY", "")
 GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile,openai/gpt-oss-120b").split(",") if m.strip()]
 APP_URL = os.getenv("APP_URL") or os.environ["RENDER_EXTERNAL_URL"]  # https-адрес сервера (на Render подставляется сам)
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
@@ -50,13 +50,19 @@ PERS = {"sarc": "Дерзкая и саркастичная, любит подк
         "play": "Игривая, любит флирт и шутки", "calm": "Спокойная и умная, глубокие разговоры",
         "fun": "Весёлая подруга, мемы и болтовня"}
 
-db = sqlite3.connect("data.db", check_same_thread=False)
+db = sqlite3.connect(os.getenv("DB_PATH", "data.db"), check_same_thread=False)
 db.executescript("""
 CREATE TABLE IF NOT EXISTS msgs(uid INT, cid TEXT, role TEXT, text TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS usage(uid INT, day TEXT, n INT, PRIMARY KEY(uid, day));
 CREATE TABLE IF NOT EXISTS custom(id INTEGER PRIMARY KEY AUTOINCREMENT, uid INT, name TEXT, style TEXT, pers TEXT, about TEXT);
 CREATE TABLE IF NOT EXISTS xp(uid INT, cid TEXT, xp INT, PRIMARY KEY(uid, cid));
 CREATE TABLE IF NOT EXISTS avatars(cid TEXT PRIMARY KEY, uid INT, mime TEXT, data BLOB);
+CREATE TABLE IF NOT EXISTS photo_jobs(
+    id TEXT PRIMARY KEY, uid INT NOT NULL, cid TEXT NOT NULL,
+    status TEXT NOT NULL, prompt TEXT DEFAULT '', mime TEXT DEFAULT 'image/png',
+    data BLOB, error TEXT DEFAULT '', created REAL NOT NULL, finished REAL
+);
+CREATE INDEX IF NOT EXISTS idx_photo_jobs_user ON photo_jobs(uid, cid, created);
 """)
 
 
@@ -114,7 +120,13 @@ async def gemini(cid: str, uid: int) -> str:
                       (uid, cid)).fetchall()[::-1]
     body = {"systemInstruction": {"parts": [{"text": get_char(uid, cid)["prompt"] + tone(level(uid, cid)[0])}]},
             "contents": [{"role": "user" if r == "user" else "model", "parts": [{"text": t}]} for r, t in rows]}
-    sys_text = body["systemInstruction"]["parts"][0]["text"]
+    sys_text = body["systemInstruction"]["parts"][0]["text"] + (
+        "\nЕсли в разговоре естественно уместно самой предложить новое безопасное фото, "
+        "иногда добавь в самый конец ответа служебный маркер [[PHOTO_REQUEST]]; не объясняй его и "
+        "не используй чаще одного раза за несколько разговорных ходов. Не добавляй маркер, если "
+        "пользователь не хочет фото. Обычный текст ответа должен оставаться естественным."
+    )
+    body["systemInstruction"]["parts"][0]["text"] = sys_text
     gmsgs = [{"role": "system", "content": sys_text}] + [
         {"role": "user" if r == "user" else "assistant", "content": t} for r, t in rows]
     async with httpx.AsyncClient(timeout=40) as c:
@@ -137,6 +149,76 @@ async def gemini(cid: str, uid: int) -> str:
             except Exception as e:
                 print("gemini error:", m, repr(e), getattr(r, "status_code", "?"), getattr(r, "text", "")[:300], flush=True)
     return "ой, что-то пошло не так, напиши ещё раз)"
+
+
+def create_photo_job(uid: int, cid: str, prompt: str = "") -> str:
+    # Keep SQLite storage bounded and protect the test API from accidental request bursts.
+    recent = db.execute(
+        "SELECT COUNT(*) FROM photo_jobs WHERE uid=? AND created>?",
+        (uid, time.time() - 3600)
+    ).fetchone()[0]
+    if recent >= 5:
+        raise HTTPException(429, "photo rate limit")
+    job_id = hashlib.sha256(f"{uid}:{cid}:{time.time_ns()}".encode()).hexdigest()[:24]
+    db.execute(
+        "INSERT INTO photo_jobs(id,uid,cid,status,prompt,created) VALUES(?,?,?,'pending',?,?)",
+        (job_id, uid, cid, prompt[:500], time.time())
+    )
+    # Retain at most 30 recent photo jobs per user; images are stored in SQLite for this MVP.
+    old = db.execute(
+        "SELECT id FROM photo_jobs WHERE uid=? ORDER BY created DESC LIMIT -1 OFFSET 30",
+        (uid,)
+    ).fetchall()
+    if old:
+        db.executemany("DELETE FROM photo_jobs WHERE id=?", old)
+    db.commit()
+    return job_id
+
+
+def photo_prompt_for(uid: int, cid: str, user_prompt: str = "") -> str:
+    char = get_char(uid, cid)
+    if not char:
+        raise HTTPException(404, "character not found")
+    details = char.get("bio", "")
+    if cid.startswith("c") and cid[1:].isdigit():
+        row = db.execute(
+            "SELECT name, style, about FROM custom WHERE id=? AND uid=?",
+            (int(cid[1:]), uid)
+        ).fetchone()
+        if row:
+            details = f"{row[0]}; style: {row[1]}; description: {row[2]}"
+    scene = user_prompt.strip()[:400] or "a fresh, natural lifestyle portrait in a tasteful outfit"
+    return (
+        f"Create a new safe-for-work image of the same fictional adult character, clearly age 21+. "
+        f"Character identity and traits: {details}. Scene requested: {scene}. "
+        "Preserve recognizable facial features, hair, age and overall appearance from the supplied reference image. "
+        "Photorealistic, natural proportions, tasteful clothing, non-sexual pose, no nudity."
+    )
+
+
+async def process_photo_job(job_id: str, uid: int, cid: str, user_prompt: str = ""):
+    try:
+        prompt = photo_prompt_for(uid, cid, user_prompt)
+        avatar_row = db.execute(
+            "SELECT data FROM avatars WHERE cid=? AND (uid=? OR uid=0)",
+            (cid, uid)
+        ).fetchone()
+        reference = avatar_row[0] if avatar_row else None
+        image = await generate_photo(
+            prompt, api_key=GEMINI_KEY, reference_image=reference
+        )
+        db.execute(
+            "UPDATE photo_jobs SET status='completed', mime='image/png', data=?, finished=? WHERE id=? AND uid=?",
+            (image, time.time(), job_id, uid)
+        )
+        db.commit()
+    except Exception as exc:
+        print("photo job failed:", job_id, repr(exc), flush=True)
+        db.execute(
+            "UPDATE photo_jobs SET status='failed', error=?, finished=? WHERE id=? AND uid=?",
+            (str(exc)[:300], time.time(), job_id, uid)
+        )
+        db.commit()
 
 
 bot = Bot(BOT_TOKEN)
@@ -171,6 +253,62 @@ print("3: app created", flush=True)
 class ChatIn(BaseModel):
     cid: str
     text: str
+
+
+class PhotoIn(BaseModel):
+    cid: str
+    prompt: str = ""
+
+
+@app.post("/api/photos")
+async def request_photo(p: PhotoIn, background_tasks: BackgroundTasks, x_init: str = Header()):
+    uid = auth(x_init)
+    if not get_char(uid, p.cid):
+        raise HTTPException(404, "character not found")
+    if not GEMINI_KEY:
+        raise HTTPException(503, "image generation is not configured")
+    job_id = create_photo_job(uid, p.cid, p.prompt)
+    background_tasks.add_task(process_photo_job, job_id, uid, p.cid, p.prompt)
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/api/photos")
+def list_photos(cid: str, x_init: str = Header()):
+    uid = auth(x_init)
+    if not get_char(uid, cid):
+        raise HTTPException(404, "character not found")
+    rows = db.execute(
+        "SELECT id,status,created FROM photo_jobs WHERE uid=? AND cid=? ORDER BY created DESC LIMIT 30",
+        (uid, cid)
+    ).fetchall()
+    return {"photos": [{"id": r[0], "status": r[1], "created": r[2]} for r in rows]}
+
+
+@app.get("/api/photos/{job_id}")
+def photo_status(job_id: str, x_init: str = Header()):
+    uid = auth(x_init)
+    row = db.execute(
+        "SELECT status,error FROM photo_jobs WHERE id=? AND uid=?",
+        (job_id, uid)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return {"status": row[0], "error": row[1] if row[0] == "failed" else ""}
+
+
+@app.get("/api/photos/{job_id}/image")
+def photo_image(job_id: str, x_init: str = Header(default=""), init_data: str = Query(default="")):
+    uid = auth(init_data or x_init)
+    row = db.execute(
+        "SELECT mime,data FROM photo_jobs WHERE id=? AND uid=? AND status='completed'",
+        (job_id, uid)
+    ).fetchone()
+    if not row or not row[1]:
+        raise HTTPException(404)
+    return Response(
+        content=row[1], media_type=row[0],
+        headers={"Cache-Control": "private, max-age=86400"}
+    )
 
 
 @app.post("/webhook")
@@ -245,7 +383,7 @@ def delete(cid: str, x_init: str = Header()):
         raise HTTPException(404)
     db.execute("DELETE FROM custom WHERE id=? AND uid=?", (int(cid[1:]), uid))
     db.execute("DELETE FROM avatars WHERE cid=? AND uid=?", (cid, uid))
-    for t in ("msgs", "xp"):
+    for t in ("msgs", "xp", "photo_jobs"):
         db.execute(f"DELETE FROM {t} WHERE uid=? AND cid=?", (uid, cid))
     db.commit()
     return {"ok": True}
@@ -296,7 +434,7 @@ def history(cid: str, x_init: str = Header()):
 
 
 @app.post("/api/chat")
-async def chat(p: ChatIn, x_init: str = Header()):
+async def chat(p: ChatIn, background_tasks: BackgroundTasks, x_init: str = Header()):
     uid = auth(x_init)
     if not get_char(uid, p.cid) or not p.text.strip():
         raise HTTPException(400)
@@ -307,11 +445,27 @@ async def chat(p: ChatIn, x_init: str = Header()):
     if DAILY_LIMIT > 0:
         db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(uid,day) DO UPDATE SET n=n+1", (uid, day))
     reply = await gemini(p.cid, uid)
+    # The private marker is emitted only when the character chooses to offer a new photo.
+    initiative = "[[PHOTO_REQUEST]]" in reply
+    reply = reply.replace("[[PHOTO_REQUEST]]", "").strip()
     db.execute("INSERT INTO msgs VALUES(?,?,?,?,?)", (uid, p.cid, "model", reply, time.time()))
     db.execute("INSERT INTO xp VALUES(?,?,1) ON CONFLICT(uid,cid) DO UPDATE SET xp=xp+1", (uid, p.cid))
     db.commit()
+    photo_job_id = None
+    lowered = p.text.lower()
+    user_asked = any(word in lowered for word in (
+        "фото", "фотку", "фотограф", "снимок", "селфи", "picture", "photo", "selfie"
+    )) and not any(neg in lowered for neg in ("не надо фото", "не присылай", "не отправляй", "без фото"))
+    if initiative or user_asked:
+        try:
+            photo_job_id = create_photo_job(uid, p.cid, "")
+            background_tasks.add_task(process_photo_job, photo_job_id, uid, p.cid, "")
+        except HTTPException as exc:
+            if exc.status_code != 429:
+                raise
     lv, prog = level(uid, p.cid)
-    return {"reply": reply, "level": lv, "progress": prog, "left": left(uid)}
+    return {"reply": reply, "level": lv, "progress": prog, "left": left(uid),
+            "photo_job_id": photo_job_id}
 
 
 if __name__ == "__main__":

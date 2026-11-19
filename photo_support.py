@@ -7,7 +7,10 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 
 
-async def generate_photo(prompt: str, api_key: str = None) -> bytes:
+async def generate_photo(
+    prompt: str, api_key: str = None, reference_image: bytes = None,
+    reference_mime: str = "image/png"
+) -> bytes:
     api_key = api_key or os.getenv("GEMINI_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_KEY is not configured")
@@ -19,8 +22,16 @@ async def generate_photo(prompt: str, api_key: str = None) -> bytes:
         "and visibly an adult. Use tasteful clothing, a natural pose, realistic or anime "
         "style as requested, and no nudity or sexual content. User request: " + prompt
     )
+    parts = [{"text": safe_prompt}]
+    if reference_image:
+        parts.append({
+            "inlineData": {
+                "mimeType": reference_mime,
+                "data": base64.b64encode(reference_image).decode("ascii"),
+            }
+        })
     body = {
-        "contents": [{"role": "user", "parts": [{"text": safe_prompt}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
 
