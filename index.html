@@ -16,7 +16,7 @@ body:before,body:after{content:"";position:fixed;z-index:-1;pointer-events:none;
 .card,.row{position:relative;overflow:hidden;cursor:pointer;background:linear-gradient(145deg,rgba(31,34,66,.92),rgba(17,19,41,.9));border:1px solid var(--line);border-radius:22px;padding:15px;box-shadow:inset 0 1px rgba(255,255,255,.045),var(--glow);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
 .card:active,.row:active{transform:scale(.975)}.card:before{content:"";position:absolute;width:120px;height:120px;border-radius:50%;right:-52px;top:-58px;background:var(--card-glow,rgba(154,107,255,.25));filter:blur(22px)}
 .card:nth-child(3n+2){--card-glow:rgba(255,73,190,.38);--accent:var(--pink)}.card:nth-child(3n){--card-glow:rgba(48,213,255,.3);--accent:var(--cyan)}.card:nth-child(3n+1){--accent:var(--violet)}
-.card .em{position:relative;font-size:48px;text-align:center;padding:10px 0 12px;filter:drop-shadow(0 7px 14px rgba(0,0,0,.35))}.card b{position:relative;display:block;margin-top:2px;font-size:15px;letter-spacing:.01em}.card small,.row small{position:relative;display:block;color:var(--mut);font-size:12px;margin-top:4px;line-height:1.4}.card b:after{content:"";display:block;width:28px;height:2px;border-radius:2px;background:var(--accent,var(--violet));margin-top:9px;box-shadow:0 0 12px var(--accent,var(--violet))}
+.card .em{position:relative;font-size:48px;text-align:center;padding:10px 0 12px;filter:drop-shadow(0 7px 14px rgba(0,0,0,.35))}.portrait{width:100%;height:150px;object-fit:cover;object-position:center 28%;border-radius:15px;border:1px solid rgba(255,255,255,.14);box-shadow:0 8px 22px rgba(0,0,0,.28)}.row .portrait{width:48px;height:48px;flex:0 0 48px;border-radius:14px}.top .portrait{width:38px;height:38px;flex:0 0 38px;border-radius:50%}.card b{position:relative;display:block;margin-top:2px;font-size:15px;letter-spacing:.01em}.card small,.row small{position:relative;display:block;color:var(--mut);font-size:12px;margin-top:4px;line-height:1.4}.card b:after{content:"";display:block;width:28px;height:2px;border-radius:2px;background:var(--accent,var(--violet));margin-top:9px;box-shadow:0 0 12px var(--accent,var(--violet))}
 .row{display:flex;gap:13px;align-items:center;margin-bottom:10px;padding:12px 14px}.row .em{font-size:34px;width:48px;height:48px;display:grid;place-items:center;border-radius:15px;background:rgba(143,112,255,.12)}
 nav{display:flex;justify-content:space-around;gap:8px;padding:11px 10px calc(11px + env(safe-area-inset-bottom));background:rgba(12,13,29,.88);border-top:1px solid var(--line);backdrop-filter:blur(22px)}
 nav button{background:transparent;border:0;color:#8587a8;font:600 13px system-ui,sans-serif;padding:8px 17px;border-radius:14px;transition:.2s}nav .on{color:#fff;background:linear-gradient(110deg,rgba(154,107,255,.24),rgba(255,88,200,.16));box-shadow:inset 0 0 0 1px rgba(183,148,255,.2),0 0 20px rgba(154,107,255,.12)}
@@ -44,23 +44,24 @@ const H={'X-Init':tg.initData,'Content-Type':'application/json'};
 const $=s=>document.querySelector(s),main=$('#main');
 let chars=[],left=0,cur=null;
 const api=(p,o)=>fetch('/api/'+p,{headers:H,...o}).then(r=>{if(!r.ok)throw r;return r.json()});
-const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc=s=>String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const avatarHTML=c=>c.avatar?'<img class="portrait" alt="Портрет '+esc(c.name)+'" src="/api/avatar/'+encodeURIComponent(c.id)+'?init_data='+encodeURIComponent(tg.initData)+'">':'<div class="em">'+c.emoji+'</div>';
 
 async function load(){const d=await api('chars');chars=d.chars;left=d.left}
 function view(v){
   cur=null;$('#inp').style.display='none';$('#nav').style.display='flex';
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.v==v));
-  if(v=='home')main.innerHTML='<div class="grid"><div class="card" id="newc"><div class="em">➕</div><b>Создать</b><small>свою ИИ-девушку</small></div>'+chars.map(c=>`<div class="card" data-c="${c.id}"><div class="em">${c.emoji}</div><b>${esc(c.name)}</b><small>${esc(c.bio||'')}</small></div>`).join('')+'</div>';
-  if(v=='chats')main.innerHTML=chars.slice().sort((a,b)=>b.ts-a.ts).map(c=>`<div class="row" data-c="${c.id}"><div class="em">${c.emoji}</div><div><b>${c.name}</b><br><small>${esc(c.last||'Начать диалог')}</small></div></div>`).join('');
-  if(v=='me')main.innerHTML=`<div class="lim">Сообщений осталось сегодня: ${left}</div>`;
+  if(v=='home')main.innerHTML='<div class="grid"><div class="card" id="newc"><div class="em">➕</div><b>Создать</b><small>свою ИИ-девушку</small></div>'+chars.map(c=>`<div class="card" data-c="${c.id}">${avatarHTML(c)}<b>${esc(c.name)}</b><small>${esc(c.bio||'')}</small></div>`).join('')+'</div>';
+  if(v=='chats')main.innerHTML=chars.slice().sort((a,b)=>b.ts-a.ts).map(c=>`<div class="row" data-c="${c.id}">${avatarHTML(c)}<div><b>${esc(c.name)}</b><br><small>${esc(c.last||'Начать диалог')}</small></div></div>`).join('');
+  if(v=='me')main.innerHTML=`<div class="lim">${left<0?'Дневного лимита сообщений нет':`Сообщений осталось сегодня: ${left}`}</div>`;
   main.querySelectorAll('[data-c]').forEach(e=>e.onclick=()=>openChat(e.dataset.c));
   const nc=$('#newc');if(nc)nc.onclick=createView;
 }
 function bubble(role,text){const d=document.createElement('div');d.className='m '+(role=='user'?'user':'');d.textContent=text;$('.msgs').appendChild(d);main.scrollTop=main.scrollHeight;return d}
-function hud(lv,pr,l){left=l;$('#lv').textContent='Ур. '+lv;$('#pr').style.width=(pr*100)+'%';$('#lim').textContent=l>0?`Осталось сообщений: ${l}`:'Лимит на сегодня исчерпан, возвращайся завтра'}
+function hud(lv,pr,l){left=l;$('#lv').textContent='Ур. '+lv;$('#pr').style.width=(pr*100)+'%';$('#lim').textContent=l<0?'Сообщения без дневного лимита':(l>0?`Осталось сообщений: ${l}`:'Лимит на сегодня исчерпан, возвращайся завтра')}
 async function openChat(id){
   cur=id;const c=chars.find(x=>x.id==id);$('#nav').style.display='none';$('#inp').style.display='flex';
-  main.innerHTML=`<div class="top"><button onclick="view('home')" style="background:none;border:0;color:#fff;font-size:20px">‹</button><b>${c.emoji} ${esc(c.name)}</b>${c.custom?'<button onclick="del()" style="background:none;border:0;color:#9a92a8">🗑</button>':''}<span id="lv"></span><div class="bar"><i id="pr"></i></div></div><div class="msgs"></div><div class="lim" id="lim"></div>`;
+  main.innerHTML=`<div class="top"><button onclick="view('home')" style="background:none;border:0;color:#fff;font-size:20px">‹</button>${avatarHTML(c)}<b>${esc(c.name)}</b>${c.custom?'<button onclick="del()" style="background:none;border:0;color:#9a92a8">🗑</button>':''}<span id="lv"></span><div class="bar"><i id="pr"></i></div></div><div class="msgs"></div><div class="lim" id="lim"></div>`;
   const h=await api('history/'+id);h.msgs.forEach(m=>bubble(m.role,m.text));hud(h.level,h.progress,h.left);
 }
 async function send(){
@@ -77,8 +78,8 @@ function createView(){
   const pick=(id,set)=>document.querySelectorAll('#'+id+' .chip').forEach(c=>c.onclick=()=>{document.querySelectorAll('#'+id+' .chip').forEach(x=>x.classList.remove('on'));c.classList.add('on');set(c.dataset.v)});
   pick('sty',v=>st=v);pick('per',v=>pe=v);
   $('#mk').onclick=async()=>{const nm=$('#nm').value.trim();if(!nm)return tg.showAlert('Введи имя');
-    try{await api('create',{method:'POST',body:JSON.stringify({name:nm,style:st,pers:pe,about:$('#ab').value})});await load();view('home')}
-    catch(e){tg.showAlert(e.status==429?'Максимум 5 персонажей':'Ошибка, попробуй ещё раз')}}
+    try{const mk=$('#mk');mk.disabled=true;mk.textContent='Создаю портрет…';await api('create',{method:'POST',body:JSON.stringify({name:nm,style:st,pers:pe,about:$('#ab').value})});await load();view('home')}
+    catch(e){const mk=$('#mk');if(mk){mk.disabled=false;mk.textContent='Создать'}tg.showAlert(e.status==429?'Максимум 5 персонажей':'Не удалось создать персонажа. Проверь настройки AI API и попробуй ещё раз')}}
 }
 $('#send').onclick=send;$('#t').onkeydown=e=>{if(e.key=='Enter')send()};
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>view(b.dataset.v));
